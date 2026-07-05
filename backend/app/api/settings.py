@@ -118,14 +118,14 @@ def save_tickflow_key(req: TickflowKeyIn, request: Request) -> dict:
       1. 临时用新 key 探测(付费端点),判定档位
       2. 判定为 none(连单只日K都拿不到)→ key 无效:不存,清除已存的,
          返回 {ok: false, reason: "invalid"},前端提示「Key 无效」
-      3. 判定为 free(免费有效 key)→ 存 key,客户端切到 free-api 服务器
-      4. 判定为 starter+ → 存 key,切到付费端点(现有逻辑)
+      3. 仅有 none/free 能力 → 存 key,客户端切到 free-api 服务器
+      4. 含付费档或独立能力 → 存 key,切到付费端点(现有逻辑)
 
     端点联动:从无 key 升级到付费 key 时,残留的 free-api 端点不可用,
     故自动切到默认付费端点(api.tickflow.org);free 档则清除自定义端点。
     """
     from app.tickflow.policy import (
-        base_tier_name, is_invalid_key,
+        base_tier_name, capset_requires_paid_endpoint, is_invalid_key,
     )
 
     key = req.api_key.strip()
@@ -160,9 +160,9 @@ def save_tickflow_key(req: TickflowKeyIn, request: Request) -> dict:
             "capabilities_count": len(capset.all()),
         }
 
-    # ===== 3) free 档(免费有效 key)→ 存 key,切到 free-api 服务器 =====
-    if base_tier_name() == "free":
-        # 免费档运行时走 free-api 服务器,清除付费端点的自定义配置
+    # ===== 3) 仅 none/free 能力 → 存 key,切到 free-api 服务器 =====
+    if not capset_requires_paid_endpoint(capset):
+        # 免费能力集运行时走 free-api 服务器,清除付费端点的自定义配置
         secrets_store.clear("tickflow_base_url")
         tf_client.reset_clients()
         return {
@@ -175,7 +175,7 @@ def save_tickflow_key(req: TickflowKeyIn, request: Request) -> dict:
             "capabilities_count": len(capset.all()),
         }
 
-    # ===== 4) starter+ 付费档 → 确保走付费端点(现有逻辑) =====
+    # ===== 4) 付费档或独立能力 → 确保走付费端点(现有逻辑) =====
     # 若之前是 none/free(无自定义付费端点),切到默认付费端点
     base = secrets_store.load().get("tickflow_base_url")
     if not base:

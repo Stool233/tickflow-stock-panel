@@ -398,7 +398,7 @@ function TierHelpPopover({ currentLabel }: { currentLabel: string }) {
               {/* 检测说明 */}
               <div className="text-secondary space-y-1.5">
                 <div className="font-medium text-foreground">档位检测说明</div>
-                <p>保存 Key 后系统会在付费端点逐一试探数据能力:连单只日K都拿不到则判为「None」(不存 Key);有日K但无复权因子则判为「Free」;有复权因子再按代表能力判定 Starter/Pro/Expert。</p>
+                <p>保存 Key 后系统会在付费端点逐一试探数据能力:连单只日K和独立付费能力都拿不到则判为「None」(不存 Key);有日K但无复权因子且无独立付费能力则判为「Free」;财务独立订阅会显示为「+ 财务」;有复权因子再按代表能力判定 Starter/Pro/Expert。</p>
                 <p className="text-muted">None 档与 Free 档运行时都走免费数据通道(仅历史日K),区别仅在于是否保存了 Key。付费档走付费端点,享有实时行情等完整能力。</p>
               </div>
             </motion.div>

@@ -6,7 +6,7 @@
 5 档体系下服务器归属:
   - none 档(无 key / 无效 key) → TickFlow.free()(free-api 服务器)
   - free 档(免费有效 key)      → TickFlow.free()(key 被 SDK 忽略,运行时走 free-api)
-  - starter/pro/expert(付费 key) → TickFlow(api_key=key, base_url)
+  - starter/pro/expert 或含 extra 付费能力 → TickFlow(api_key=key, base_url)
 """
 from __future__ import annotations
 
@@ -32,14 +32,15 @@ PAID_ENDPOINT = "https://api.tickflow.org"
 def _should_use_free_server() -> bool:
     """是否应走 free-api 服务器。
 
-    判定依据:无 key,或当前档位为 none/free。
-    付费档(starter+)走付费端点。
+    判定依据:无 key,或当前能力集只有 none/free 能力。
+    付费档与独立能力订阅走付费端点。
     """
     if not secrets_store.get_tickflow_key():
         return True
-    # 有 key 时按探测出的档位判定(避免读 capabilities.json 在首次启动前未生成的边界)
-    from app.tickflow.policy import base_tier_name
-    return base_tier_name() in ("none", "free")
+    # 有 key 时按探测出的 capability 判定。缓存缺失/过期时保守走付费端点,
+    # 避免独立能力订阅被误切到 free-api。
+    from app.tickflow.policy import cached_capset_requires_paid_endpoint
+    return not cached_capset_requires_paid_endpoint(default=True)
 
 
 def _base_url() -> str | None:
@@ -100,11 +101,13 @@ def current_mode() -> str:
 
     - "none"    : 无 key / 无效 key(走 free-api,仅历史日K)
     - "free"    : 免费有效 key(走 free-api,仅历史日K)
-    - "api_key" : 付费 key(starter+,走付费端点,有实时行情)
+    - "api_key" : 付费档或独立能力 key(走付费端点)
     """
     if not secrets_store.get_tickflow_key():
         return "none"
-    from app.tickflow.policy import base_tier_name
+    from app.tickflow.policy import base_tier_name, cached_capset_requires_paid_endpoint
+    if cached_capset_requires_paid_endpoint(default=True):
+        return "api_key"
     tier = base_tier_name()
     if tier in ("none", "free"):
         return "free" if tier == "free" else "none"

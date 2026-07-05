@@ -32,7 +32,9 @@ _CAPSET_CACHE_FILE = "capabilities.json"
 # v2: 拆分 depth5 → depth5(单只) + depth5.batch(批量)
 # v3: 探测补全 quote.batch(此前 tiers.yaml 声明了但 _probe_real 漏探测)
 # v5: Free 档补充付费服务器 quote.by_symbol(10rpm/5标的),用于自选股实时监控。
-_CACHE_SCHEMA_VERSION = 5
+# v6: financial 可作为 extra capability,不再作为 Expert 判档特征。
+# v7: quote.batch 不再作为 Starter 判档特征,避免 Free + 财务误标 Starter。
+_CACHE_SCHEMA_VERSION = 7
 
 # 探测用最小代价请求:挑流通性最好的 1 只标的试
 _PROBE_SYMBOL = "600000.SH"  # 浦发银行,长期不会退市
@@ -268,7 +270,7 @@ def detect_capabilities(force: bool = False) -> CapabilitySet:
     # 有 API key — 真实探测
     try:
         capset, probe_log = _probe_real(tiers)
-        # 判定档位:无效 key → none,免费 key → free,付费 → starter/pro/expert
+        # 判定档位:无效 key → none,免费 key → free,付费/独立能力 → 按能力组合标注
         classified = _classify_tier(capset, tiers)
         if classified.is_invalid:
             # 无效 key(连单只日K都拿不到):归 none 档,标记要求清除 key
@@ -293,15 +295,20 @@ def detect_capabilities(force: bool = False) -> CapabilitySet:
         return capset
 
 
+# quote.batch 在一些 Free + 独立能力组合中会探测成功,但不足以代表 Starter。
+_FREE_LIKE_COMPAT_CAPS: set[Cap] = {Cap.QUOTE_BATCH}
+
+
 # ===== Tier 代表性 capability(signature caps)=====
 # 拥有**任意一个**即认作该档及以上。自上而下匹配。
 # 这套设计的好处:单个 capability 探测的 transient 失败不会把整体档位"误降"。
+# financial 可独立订阅,不能再作为 Expert 的 signature,否则会误解锁 Expert-only 功能。
 TIER_SIGNATURES: dict[str, set[Cap]] = {
-    "expert":  {Cap.FINANCIAL, Cap.INTRADAY_BATCH, Cap.WEBSOCKET},
+    "expert":  {Cap.INTRADAY_BATCH, Cap.WEBSOCKET},
     "pro":     {Cap.KLINE_MINUTE_BATCH, Cap.KLINE_MINUTE_BY_SYMBOL,
                 Cap.INTRADAY, Cap.DEPTH5, Cap.DEPTH5_BATCH},
-    "starter": {Cap.QUOTE_BATCH, Cap.KLINE_DAILY_BATCH,
-                Cap.ADJ_FACTOR, Cap.QUOTE_POOL},
+    # quote.batch / kline.daily.batch 都可能在 free-like 组合中可用,不作为 Starter signature。
+    "starter": {Cap.ADJ_FACTOR, Cap.QUOTE_POOL},
     # free / none 不需 signature — 由 _classify_tier 的分水岭逻辑判定
 }
 
@@ -310,10 +317,10 @@ TIER_SIGNATURES: dict[str, set[Cap]] = {
 class TierClassification:
     """档位判定结果。
 
-    判定依据是"复权因子分水岭":
-      - 连单只日K都没有 → 无效 key(is_invalid),归 none 档
-      - 有单只日K、无复权因子 → 免费 key(is_free)
-      - 有复权因子 → 付费档(starter+),具体档位由 signature 决定
+    判定依据:
+      - 连单只日K和独立付费能力都没有 → 无效 key(is_invalid),归 none 档
+      - 仅有 free-like 能力 → 免费 key(is_free)
+      - 有独立/付费能力 → 按 signature 或 custom label 保留真实能力
     """
 
     tier: str            # "none" / "free" / "starter" / "pro" / "expert"
@@ -321,25 +328,64 @@ class TierClassification:
     is_free: bool        # 免费有效 key(有日K、无复权因子)
 
 
+def _free_like_caps(tiers: dict) -> set[Cap]:
+    """none/free 已有能力集合。独立加购能力不应被降级为 Free。"""
+    return _tier_caps_set(tiers, "none") | _tier_caps_set(tiers, "free") | _FREE_LIKE_COMPAT_CAPS
+
+
+def _paid_like_caps(capset: CapabilitySet, tiers: dict) -> set[Cap]:
+    """返回超出 none/free 的能力集合。"""
+    return set(capset.all().keys()) - _free_like_caps(tiers)
+
+
+def capset_requires_paid_endpoint(
+    capset: CapabilitySet,
+    tiers: dict | None = None,
+) -> bool:
+    """该能力集运行时是否必须走付费端点。"""
+    return bool(_paid_like_caps(capset, tiers or _load_tiers_yaml()))
+
+
+def cached_capset_requires_paid_endpoint(default: bool = True) -> bool:
+    """读取已缓存的能力集并判断是否需要付费端点。
+
+    缓存缺失或 schema 过期时返回 default。保存/刷新 Key 的探测流程会强制走
+    付费端点,因此运行期遇到未知状态时也应保守选择付费端点。
+    """
+    cache_path = settings.data_dir / _CAPSET_CACHE_FILE
+    if not cache_path.exists():
+        return default
+    try:
+        with cache_path.open(encoding="utf-8") as f:
+            cached = json.load(f)
+        if cached.get("schema_version") != _CACHE_SCHEMA_VERSION:
+            return default
+        return capset_requires_paid_endpoint(_capset_from_json(cached))
+    except Exception:
+        return default
+
+
 def _classify_tier(capset: CapabilitySet, tiers: dict) -> TierClassification:
     """根据探测出的能力集判定档位。
 
     分水岭是 KLINE_DAILY_BY_SYMBOL(单只日K)与 ADJ_FACTOR(复权因子):
-      - 无单只日K     → none(无效 key)
-      - 有日K无复权   → free(免费 key)
-      - 有复权因子    → 走 signature 判定 starter/pro/expert
+      - 无单只日K且无独立付费能力 → none(无效 key)
+      - 仅有 free-like 能力        → free(免费 key)
+      - 有独立/付费能力           → 走 signature 判定或 custom label
     """
     held = set(capset.all().keys())
+    paid_like = _paid_like_caps(capset, tiers)
 
-    # 1) 连单只日K都没有 → 无效 key
-    if Cap.KLINE_DAILY_BY_SYMBOL not in held:
+    # 1) 连单只日K都没有,且没有任何独立付费能力 → 无效 key
+    if Cap.KLINE_DAILY_BY_SYMBOL not in held and not paid_like:
         return TierClassification(tier="none", is_invalid=True, is_free=False)
 
-    # 2) 有日K但无复权因子 → 免费 key
-    if Cap.ADJ_FACTOR not in held:
+    # 2) 仅有 free-like 能力 → 免费 key。
+    # 财务独立订阅可能没有复权因子,但只要 financial 探测成功就不能丢掉该能力。
+    if not paid_like:
         return TierClassification(tier="free", is_invalid=False, is_free=True)
 
-    # 3) 有复权因子 → 付费档,按 signature 自上而下判定
+    # 3) 有独立/付费能力 → 按 signature 自上而下判定
     if held & TIER_SIGNATURES["expert"]:
         base = "expert"
     elif held & TIER_SIGNATURES["pro"]:
@@ -347,8 +393,8 @@ def _classify_tier(capset: CapabilitySet, tiers: dict) -> TierClassification:
     elif held & TIER_SIGNATURES["starter"]:
         base = "starter"
     else:
-        # 有复权因子但无任何代表能力 — 兜底为 starter(复权本身是 starter 特征)
-        base = "starter"
+        # 有独立能力但无套餐 signature — 基础档保持 free,能力作为 extra 展示。
+        base = "free"
     return TierClassification(tier=base, is_invalid=False, is_free=False)
 
 # 补丁友好命名(label 后缀用)
@@ -378,6 +424,8 @@ def _override_limits_with_detected_tier(
     label 可能是 "Pro" / "Pro + 分钟K" / "Pro+" 等组合形式 — 取第一个词当作基线档名。
     """
     base_name = label.split()[0].split("+")[0].strip().lower()  # "Pro + 分钟K" → "pro"
+    if base_name not in tiers:
+        return capset
     tier_limits = tiers.get(base_name, {})
     new_caps: dict[Cap, CapabilityLimits] = {}
     for cap, _old_lim in capset.all().items():
@@ -389,12 +437,11 @@ def _override_limits_with_detected_tier(
                 subscribe=spec.get("subscribe"),
             )
         else:
-            # 不在该档定义里(extras),用 expert 档兜底(最宽松)
-            expert_spec = tiers.get("expert", {}).get(cap.value, {})
+            # 不在该档定义里(extras),保留探测阶段得到的默认/响应头 limits。
             new_caps[cap] = CapabilityLimits(
-                rpm=expert_spec.get("rpm"),
-                batch=expert_spec.get("batch"),
-                subscribe=expert_spec.get("subscribe"),
+                rpm=_old_lim.rpm,
+                batch=_old_lim.batch,
+                subscribe=_old_lim.subscribe,
             )
     return CapabilitySet(new_caps)
 
@@ -421,6 +468,7 @@ def _compute_label_and_missing(
             return tier_name.capitalize(), [], []
 
     # 2) 按 signature 自上而下判档
+    paid_like = held - _free_like_caps(tiers)
     if held & TIER_SIGNATURES["expert"]:
         base = "expert"
     elif held & TIER_SIGNATURES["pro"]:
@@ -431,12 +479,10 @@ def _compute_label_and_missing(
         base = "free"
 
     base_caps = _tier_caps_set(tiers, base)
-    missing = sorted(c.value for c in (base_caps - held))
-    extras = base_caps and (held - base_caps) or set()  # extras 是超出该档的部分
-
-    # 实际超出 = held 中"既不属于本档、也不属于本档下方任何档"的 cap
-    # 简化:extras = held - base_caps
-    extras_set = held - base_caps
+    label_base_caps = base_caps | (_FREE_LIKE_COMPAT_CAPS if base == "free" else set())
+    # 独立能力组合以 free 为基础展示时,不把 free 的缺项当作套餐缺失。
+    missing = [] if base == "free" and paid_like else sorted(c.value for c in (base_caps - held))
+    extras_set = held - label_base_caps
 
     # 3) 拼 label
     if not extras_set:
