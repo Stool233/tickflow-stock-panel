@@ -398,6 +398,7 @@ def get_preferences() -> dict:
         "system_notify_enabled": preferences.get_system_notify_enabled(),
         "feishu_webhook_url": preferences.get_feishu_webhook_url(),
         "feishu_webhook_secret": preferences.get_feishu_webhook_secret(),
+        "wecom_webhook_url": preferences.get_wecom_webhook_url(),
         "webhook_enabled_default": preferences.get_webhook_enabled_default(),
         "sidebar_index_symbols": preferences.get_sidebar_index_symbols(),
         "nav_order": preferences.get_nav_order(),
@@ -413,10 +414,11 @@ def get_preferences() -> dict:
 
 @router.get("/data-sources")
 def list_data_sources() -> dict:
-    """列出已加载的自定义数据源。"""
+    """列出已加载的数据源 (内置 / 插件 / 用户自定义)。"""
     from app.data_providers import custom as custom_sources
     return {
-        "builtin": [{"name": "tickflow", "display_name": "TickFlow", "datasets": ["daily", "adj_factor", "realtime"]}],
+        "builtin": [{"name": "tickflow", "display_name": "TickFlow", "datasets": ["daily", "adj_factor", "realtime", "minute"]}],
+        "plugins": custom_sources.list_plugins(),
         "custom": custom_sources.list_sources(),
         "errors": custom_sources.errors(),
         "config_dir": str(custom_sources.data_sources_dir()),
@@ -429,6 +431,52 @@ def reload_data_sources() -> dict:
     from app.data_providers import custom as custom_sources
     custom_sources.load_all()
     return list_data_sources()
+
+
+@router.post("/plugins/{name}/install")
+def install_plugin(name: str) -> dict:
+    """安装指定插件的依赖 (npm install / pip install), 完成后重新扫描。
+
+    根据 plugin.yaml 的 runtime 字段决定安装方式。安装可能耗时较长 (网络下载),
+    客户端需设较长超时。
+    """
+    from app.data_providers import custom as custom_sources
+    if not custom_sources.is_builtin(name):
+        raise HTTPException(status_code=404, detail=f"插件 '{name}' 不存在")
+    ok, message = custom_sources.install_plugin(name)
+    # 无论成功失败都重新扫描, 刷新插件状态 (安装可能部分成功)
+    custom_sources.load_all()
+    result = list_data_sources()
+    result["install_ok"] = ok
+    result["install_message"] = message
+    return result
+
+
+@router.delete("/plugins/{name}/install")
+def uninstall_plugin(name: str) -> dict:
+    """卸载指定插件的依赖 (删除 node_modules / pip uninstall), 完成后重新扫描。
+
+    如果该插件当前正被使用, 自动回退到 tickflow。
+    """
+    from app.data_providers import custom as custom_sources
+    from app.services import preferences
+    if not custom_sources.is_builtin(name):
+        raise HTTPException(status_code=404, detail=f"插件 '{name}' 不存在")
+    ok, message = custom_sources.uninstall_plugin(name)
+    # 卸载后若该插件正被使用, 回退 tickflow
+    for getter, key, default in [
+        (preferences.get_daily_data_provider, "daily_data_provider", "tickflow"),
+        (preferences.get_minute_data_provider, "minute_data_provider", "tickflow"),
+        (preferences.get_realtime_data_provider, "realtime_data_provider", "tickflow"),
+        (preferences.get_financial_provider, "financial_data_provider", "tickflow"),
+    ]:
+        if getter() == name:
+            preferences.save({key: default})
+    custom_sources.load_all()
+    result = list_data_sources()
+    result["uninstall_ok"] = ok
+    result["uninstall_message"] = message
+    return result
 
 
 @router.get("/data-sources/{name}")
@@ -772,6 +820,31 @@ def update_feishu_webhook(req: FeishuWebhookPrefsIn) -> dict:
     saved_url = preferences.set_feishu_webhook_url(url)
     saved_secret = preferences.set_feishu_webhook_secret((req.secret or "").strip())
     return {"feishu_webhook_url": saved_url, "feishu_webhook_secret": saved_secret}
+
+
+class WecomWebhookPrefsIn(BaseModel):
+    url: str
+
+
+@router.put("/preferences/wecom-webhook")
+def update_wecom_webhook(req: WecomWebhookPrefsIn) -> dict:
+    """企业微信群机器人 Webhook 地址 — 与飞书并列的第二推送通道。
+
+    - url: 传入空串表示清空配置; 非空需为合法企业微信群机器人地址, 或纯 key。
+    - 用户可只填 key (webhook/send?key=xxx 的 xxx 部分), 后端自动补全为完整 URL。
+    """
+    from app.services import preferences
+    from app.services import webhook_adapter
+
+    url = (req.url or "").strip()
+    if url and not webhook_adapter.is_valid_wecom_url(url):
+        raise HTTPException(
+            status_code=400,
+            detail="Webhook 地址非法, 需为企业微信群机器人地址 "
+                   "(https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=... 或纯 key)",
+        )
+    saved_url = preferences.set_wecom_webhook_url(url)
+    return {"wecom_webhook_url": saved_url}
 
 
 class WebhookEnabledDefaultIn(BaseModel):

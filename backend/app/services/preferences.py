@@ -90,6 +90,11 @@ def get_minute_sync_enabled() -> bool:
     return load().get("minute_sync_enabled", False)
 
 
+def get_minute_intraday_refresh() -> bool:
+    """自选列表分时图是否跟随实时行情刷新 (默认关闭, 开启后盘中按 SSE 频率刷新)。"""
+    return load().get("minute_intraday_refresh", False)
+
+
 def get_minute_sync_days() -> int:
     return max(1, min(30, load().get("minute_sync_days", 5)))
 
@@ -278,9 +283,9 @@ def set_depth_finalize_time(hour: int, minute: int) -> dict:
     return {"hour": h, "minute": m}
 
 
-# 复盘推送可选渠道白名单 (微信等暂未实现, 不在白名单内, 前端仅作占位)
+# 复盘推送可选渠道白名单 (企业微信已实现, 与飞书并列)
 # 多选: 不推送 = 空数组, 而非 'none'
-REVIEW_PUSH_CHANNELS = {"feishu"}
+REVIEW_PUSH_CHANNELS = {"feishu", "wecom"}
 
 
 def get_review_schedule() -> dict:
@@ -471,6 +476,25 @@ def set_feishu_webhook_secret(secret: str) -> str:
     return get_feishu_webhook_secret()
 
 
+def get_wecom_webhook_url() -> str:
+    """企业微信群机器人 Webhook 地址 — 与飞书并列的第二推送通道。
+
+    存储完整 URL (https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx);
+    用户也可只填 key, 由 webhook_adapter.normalize_wecom_url 自动补全。
+    """
+    return load().get("wecom_webhook_url", "")
+
+
+def set_wecom_webhook_url(url: str) -> str:
+    """保存企业微信 Webhook 地址。传入空串表示清空配置。
+
+    存储时统一补全为完整 URL, 避免后续每次推送都要再判一次。
+    """
+    from app.services.webhook_adapter import normalize_wecom_url
+    save({"wecom_webhook_url": normalize_wecom_url(url)})
+    return get_wecom_webhook_url()
+
+
 def get_webhook_enabled_default() -> bool:
     """新建监控规则时是否默认勾选「飞书推送」。
 
@@ -510,6 +534,8 @@ def set_realtime_monitor_config(cfg: dict) -> dict:
         updates["sidebar_index_symbols"] = [s for s in cfg["sidebar_index_symbols"] if s in allowed]
     if "screener_auto_run" in cfg:
         updates["screener_auto_run"] = bool(cfg["screener_auto_run"])
+    if "minute_intraday_refresh" in cfg:
+        updates["minute_intraday_refresh"] = bool(cfg["minute_intraday_refresh"])
     if updates:
         save(updates)
     return get_realtime_monitor_config()
@@ -523,6 +549,7 @@ def get_realtime_monitor_config() -> dict:
         "strategy_monitor_ids": get_strategy_monitor_ids(),
         "sidebar_index_symbols": get_sidebar_index_symbols(),
         "screener_auto_run": get_screener_auto_run(),
+        "minute_intraday_refresh": get_minute_intraday_refresh(),
     }
 
 
